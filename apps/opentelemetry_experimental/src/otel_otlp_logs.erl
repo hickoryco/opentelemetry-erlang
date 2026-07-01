@@ -71,20 +71,25 @@ log_record(#{level := Level,
     {SeverityNumber, SeverityText} = level_to_severity(Level),
     Body1 = case format_msg(Body, Metadata, Config) of
                 S when ?IS_STRING(S) ->
-                    %% if body is a string, make it a single line
+                    %% if body is a string, make it a single line.
+                    %% Return a binary (not a charlist): otel_otlp_common:to_any_value/1
+                    %% encodes a list as an OTLP array_value of int_value elements, so a
+                    %% charlist body ships as [84,76,83,...] instead of a string_value.
+                    %% (hickory patch — upstream still emits a charlist here; see
+                    %% open-telemetry/opentelemetry-erlang otel_otlp_logs.erl.)
                     T = lists:reverse(
                           trim(
                             lists:reverse(
                               trim(S, false)), true)),
                     re:replace(T,",?\r?\n\s*",", ",
-                               [{return,list}, global, unicode]);
+                               [{return,binary}, global, unicode]);
                 M ->
                     M
             end,
     Attributes = maps:without([gl, time, report_cb], Metadata),
     Attributes1 = maps:fold(fun(K, V, Acc) ->
                                     [#{key => otel_otlp_common:to_binary(K),
-                                       value => otel_otlp_common:to_any_value(V)} | Acc]
+                                       value => otel_otlp_common:to_any_value(string_or_value(V))} | Acc]
                             end, [], Attributes),
     DroppedAttributesCount = maps:size(Attributes) - length(Attributes1),
     Flags = 0,
@@ -121,6 +126,21 @@ log_record(#{level := Level,
                dropped_attributes_count => DroppedAttributesCount,
                flags                   => Flags
               }.
+
+%% Logger metadata carries string-ish values as charlists (e.g. `file` =>
+%% "ssl_handshake.erl"). otel_otlp_common:to_any_value/1 encodes ANY list as an
+%% array_value of int_value elements, so such an attribute ships as
+%% [115,115,108,...] instead of a string. Convert printable charlists to
+%% binaries so they encode as string_value; leave genuine lists (e.g. the
+%% `domain` list of atoms) untouched. (hickory patch — same charlist/list
+%% ambiguity as the body; upstream is unfixed.)
+string_or_value(V) when is_list(V) ->
+    case io_lib:printable_unicode_list(V) of
+        true -> unicode:characters_to_binary(V);
+        false -> V
+    end;
+string_or_value(V) ->
+    V.
 
 format_msg({string, Chardata}, Meta, Config) ->
     format_msg({"~ts", [Chardata]}, Meta, Config);
